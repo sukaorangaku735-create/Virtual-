@@ -1,0 +1,71 @@
+name: bilzRdp
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    steps:
+      - name: Configure RDP
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User
+        run: |
+          $password = "P@ssw0rd2026"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          "RDP_USER=RDP" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RDP_PASS=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = Join-Path $env:TEMP "tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart", "TS_NOLAUNCH=1" -Wait
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+
+      - name: Connect Tailscale
+        run: |
+          $tsExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          & $tsExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=bilz-rdp-$env:GITHUB_RUN_ID --unattended
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 12) {
+              Start-Sleep -Seconds 5
+              $tsIP = & $tsExe ip -4 2>$null
+              $retries++
+          }
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "IP Address : $tsIP"
+          Write-Host "Username   : RDP"
+          Write-Host "Password   : P@ssw0rd2026"
+
+      - name: Verify RDP
+        run: |
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "RDP port failed"
+              exit 1
+          }
+          Write-Host "RDP Ready!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "Address  : $env:TAILSCALE_IP"
+          Write-Host "Username : $env:RDP_USER"
+          Write-Host "Password : $env:RDP_PASS"
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active"
+              Start-Sleep -Seconds 300
+          }
